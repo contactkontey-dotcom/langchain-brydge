@@ -1,4 +1,4 @@
-# @brydge-ai/langchain
+# brydge-langchain
 
 Check whether your LangChain agent's work actually happened.
 
@@ -14,7 +14,7 @@ This package connects a LangChain.js agent to BRYDGE:
 ## Install
 
 ```bash
-npm install @brydge-ai/langchain langchain @langchain/core
+npm install brydge-langchain langchain @langchain/core
 ```
 
 Requires Node.js 20 or later and `langchain` 1.3 or later.
@@ -36,7 +36,7 @@ A mandate says what the agent may do; headroom says how much of it, in any 24 ho
 import Stripe from "stripe";
 import { createAgent, tool } from "langchain";
 import { z } from "zod";
-import { BrydgeClient, authorizationFor, brydgeMiddleware } from "@brydge-ai/langchain";
+import { BrydgeClient, authorizationFor, brydgeMiddleware } from "brydge-langchain";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const brydge = new BrydgeClient(); // reads BRYDGE_API_KEY
@@ -126,7 +126,7 @@ Each entry in `tools`:
 Add `BrydgeVerifyTool` to the agent's tools. When the model calls it, BRYDGE checks the actions carried out earlier in the same run. The model cannot pass anything that changes a finding.
 
 ```ts
-import { BrydgeVerifyTool } from "@brydge-ai/langchain";
+import { BrydgeVerifyTool } from "brydge-langchain";
 
 const agent = createAgent({
   model: "anthropic:claude-sonnet-5",
@@ -155,7 +155,7 @@ If BRYDGE cannot give an answer (a bad key, an action with no declared value, a 
 LangChain wraps errors raised by middleware in its own `MiddlewareError`. Use `BrydgeError.find` to get BRYDGE's error back:
 
 ```ts
-import { BrydgeError } from "@brydge-ai/langchain";
+import { BrydgeError } from "brydge-langchain";
 
 try {
   await agent.invoke(input);

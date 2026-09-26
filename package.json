@@ -1,5 +1,5 @@
 {
-  "name": "@brydge-ai/langchain",
+  "name": "brydge-langchain",
   "version": "0.1.0",
   "description": "LangChain middleware and tools for BRYDGE: supervise an agent's tool calls, then check against the destination's own records whether the work actually happened.",
   "keywords": [
