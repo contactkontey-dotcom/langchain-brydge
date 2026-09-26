@@ -7,9 +7,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Windows as well as Linux: releases are published from Windows, where npm,
+    # npx and every node_modules/.bin tool are .cmd files and files check out
+    # with CRLF line endings.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4

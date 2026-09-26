@@ -18,7 +18,8 @@ Because the books run on `localhost`, BRYDGE must run with
 `BRYDGE_ALLOW_PRIVATE_DESTINATIONS=1`.
 
 In the BRYDGE repository, `scripts/langchain-fixture.ts` creates such a
-workspace in a local database and prints the environment these tests read:
+workspace in a local database and prints the environment these tests read.
+The commands are bash; on Windows, run them in Git Bash:
 
 ```bash
 # in the BRYDGE repository
