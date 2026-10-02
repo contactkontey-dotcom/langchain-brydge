@@ -26,6 +26,8 @@ export function fakeBrydge(
 ) {
   const sent: Sent[] = [];
   const byKey = new Map<string, { id: string; decision: "ALLOWED" | "ESCALATED" }>();
+  /* A person's answer to an escalation, by authorization — what the real settle route records. */
+  const settled = new Map<string, { verdict: "ALLOWED" | "REFUSED"; by: string }>();
   const claims = new Map<string, string>();
   let next = 0;
 
@@ -48,17 +50,42 @@ export function fakeBrydge(
     if (method === "POST" && url.pathname === "/api/supervise") {
       const key = String(body?.idempotencyKey);
       const earlier = byKey.get(key);
-      if (earlier) return json(200, { ...earlier, mandateId: null, because: "replayed", checked: [], unobserved: [], replayed: true });
+      if (earlier) {
+        /* The same key again: the stored answer, or a person's answer to it — as the real route replays. */
+        const person = earlier.decision === "ESCALATED" ? settled.get(earlier.id) : undefined;
+        if (person?.verdict === "ALLOWED") {
+          return json(200, {
+            id: earlier.id, decision: "ALLOWED", mandateId: null, checked: [], unobserved: [], replayed: true,
+            because: `authorised by ${person.by}, who allowed this one on 2026-10-02. Carry it out once`,
+            settled: "ALLOWED", next: null,
+          });
+        }
+        if (person?.verdict === "REFUSED") {
+          return json(200, {
+            id: earlier.id, decision: "ESCALATED", mandateId: null, checked: [], unobserved: [], replayed: true,
+            because: `${person.by} refused this on 2026-10-02, so it must not be carried out`,
+            settled: "REFUSED", next: null,
+          });
+        }
+        const waiting = earlier.decision === "ESCALATED";
+        return json(200, {
+          ...earlier, mandateId: null, checked: [], unobserved: [], replayed: true, settled: null,
+          because: waiting ? `replayed. ${ASK_AGAIN}` : "replayed",
+          next: waiting ? ASK_AGAIN : null,
+        });
+      }
       const decision = (options.decide ?? (() => "ALLOWED"))(body ?? {});
       const answer = { id: `sup_${++next}`, decision };
       byKey.set(key, answer);
       return json(200, {
         ...answer,
         mandateId: decision === "ALLOWED" ? "mdt_1" : null,
-        because: decision === "ALLOWED" ? "Within mandate mdt_1." : "No mandate covers refund for this agent.",
+        because: decision === "ALLOWED" ? "Within mandate mdt_1." : `no mandate covers refund for this agent. ${ASK_AGAIN}`,
         checked: [],
         unobserved: decision === "ALLOWED" ? [] : ["amount"],
         replayed: false,
+        settled: null,
+        next: decision === "ALLOWED" ? null : ASK_AGAIN,
       });
     }
 
@@ -104,5 +131,11 @@ export function fakeBrydge(
     asked: () => to("POST", "/api/supervise").filter((s) => s.path === "/api/supervise"),
     reports: () => sent.filter((s) => s.method === "POST" && s.path.endsWith("/outcome")),
     verifies: () => sent.filter((s) => s.method === "POST" && s.path.endsWith("/verify")),
+    /** A person answers the escalation with this authorization, as the settle route would. */
+    settle: (authorization: string, verdict: "ALLOWED" | "REFUSED", by = "maya") => settled.set(authorization, { verdict, by }),
   };
 }
+
+/** What the real route appends to an escalation nobody has answered yet. */
+export const ASK_AGAIN =
+  "A person has been asked. Ask again with the same idempotency key once they have answered: if they allow it, the answer is ALLOWED.";

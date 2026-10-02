@@ -26,7 +26,7 @@ Do these once, in BRYDGE:
 1. **Issue an API key** on the Connect page, and set it as `BRYDGE_API_KEY`.
 2. **Declare what the action is worth.** BRYDGE charges a share of that value, and it will not check an action nobody has priced.
 3. **Register a destination** for the action: where BRYDGE reads the records, and the read-only credential it uses. BRYDGE has a preset for Stripe refunds.
-4. **Issue a mandate** to the agent for the action. Without one, every call goes to a person.
+4. **Issue a mandate** to the agent for the action, on the agent's page in BRYDGE. Without one, every call goes to a person, and the agent goes ahead only once they allow it (see [When a person decides](#when-a-person-decides)).
 
 A mandate says what the agent may do; headroom says how much of it, in any 24 hours. A new agent starts with room for one action a day, and every report BRYDGE checks and finds true raises that. Calls beyond it go to a person. `brydge.headroom(actor, action)` shows where an agent stands.
 
@@ -43,12 +43,13 @@ const brydge = new BrydgeClient(); // reads BRYDGE_API_KEY
 
 const refund = tool(
   async ({ chargeId, amount }, config) => {
-    const r = await stripe.refunds.create({
-      charge: chargeId,
-      amount,
+    const authorization = authorizationFor(config);
+    const r = await stripe.refunds.create(
       // BRYDGE finds this refund in Stripe by this id, and by nothing else.
-      metadata: { brydge_authorization: authorizationFor(config) },
-    });
+      { charge: chargeId, amount, metadata: { brydge_authorization: authorization } },
+      // One authorization, one refund: Stripe answers a repeat under this key with the first refund.
+      { idempotencyKey: authorization },
+    );
     return `Refund ${r.id} is ${r.status}.`;
   },
   {
@@ -62,7 +63,12 @@ const agent = createAgent({
   model: "anthropic:claude-sonnet-5", // any chat model that can call tools
   tools: [refund],
   middleware: [
-    brydgeMiddleware({ client: brydge, actor: "agent:refund-ops", tools: { refund: { target: "chargeId" } } }),
+    brydgeMiddleware({
+      client: brydge,
+      actor: "agent:refund-ops",
+      // `key` names the refund by its charge, so running this again asks about the same refund.
+      tools: { refund: { target: "chargeId", key: (args) => `refund:${args.chargeId}` } },
+    }),
   ],
 });
 
@@ -77,6 +83,8 @@ for (const check of await brydge.verifyWork(result.messages)) {
 ```
 
 The action is named after the tool (`refund`), so it must match the action you set up in BRYDGE. Use `action` to name it differently.
+
+Until the agent has a mandate, BRYDGE passes the refund to a person, and the tool does not run. Allow it in BRYDGE, then run the script again: the run asks about the same refund, gets `ALLOWED`, and the refund goes ahead.
 
 ## What a check can find
 
@@ -94,9 +102,9 @@ Each finding also carries `claimed`, the outcome the middleware reported for the
 
 For each call to a tool listed under `tools`:
 
-1. **Asks BRYDGE first.** It sends the agent (`actor`), the action, the target, the facts and an idempotency key. A retried call gets the same answer; a different call never does.
-2. **Allowed:** the tool runs, and `authorizationFor(config)` returns BRYDGE's id for this call. Write it into the record your tool creates.
-3. **Escalated:** the tool does not run. The model gets an error message saying a person is deciding, with BRYDGE's reason.
+1. **Asks BRYDGE first.** It sends the agent (`actor`), the action, the target, the facts and an idempotency key that names this one action. The same call made again in the same conversation gets the same key, and so the same answer. A call with a different target or different facts never does.
+2. **Allowed:** the tool runs, and `authorizationFor(config)` returns BRYDGE's id for this call. Write it into the record your tool creates. Each authorization runs once: a call made again after this run or this process already ran it does not run the tool a second time.
+3. **Escalated:** the tool does not run. The model gets an error message saying a person is deciding, with BRYDGE's reason, and telling it to call the tool again with the same arguments once they have answered.
 4. **Reports the outcome.** When the tool returns normally, the middleware reports `SUCCEEDED`. When the tool throws or returns an error message, it reports nothing, because a call can fail before it reaches the destination. Use `outcome` to report something else.
 5. **Records the call** on the tool's message, under `message.metadata.brydge`. `verifyWork` and `supervisedActions` read it from there.
 
@@ -120,6 +128,45 @@ Each entry in `tools`:
 | `action`  | BRYDGE's name for the action. Defaults to the tool name. |
 | `facts`   | A function returning what BRYDGE's mandates judge the call by. Defaults to the call's top-level strings, numbers and booleans. BRYDGE compares a fact named `amount` with the amount in the destination's record, so give both in the same units. |
 | `outcome` | A function from the tool's result to the outcome to report, or `null` to report nothing. |
+| `key`     | A function of the arguments that names this one intended action, such as ``(args) => `refund:${args.chargeId}` ``. Calls with the same key, target and facts are one action in every thread and every process. Defaults to the conversation: see [When a person decides](#when-a-person-decides). |
+
+## When a person decides
+
+A call BRYDGE escalates waits for a person, in BRYDGE. The middleware does not wait with it. The tool does not run, and the model is told:
+
+```text
+Not done. BRYDGE has passed this to a person to decide, so it was not carried out. No mandate lets agent:refund-ops refund yet, so a person decides. Once they have answered, call refund again with the same arguments: if they allowed it, it goes ahead then. BRYDGE authorization: cmurkt2fv00027devj07vh16z.
+```
+
+When the model calls the tool again with the same arguments, the middleware asks under the same idempotency key, so BRYDGE answers with the person's decision:
+
+| The person | The call made again |
+| --- | --- |
+| has not answered yet | is escalated again, under the same authorization. The person is not asked twice. |
+| allowed it | is `ALLOWED`. The tool runs once, under the same authorization. |
+| refused it | does not run. The model is told a person refused it, and why. |
+
+What counts as the same call depends on where it is made:
+
+- **In a conversation:** a run given a `thread_id` (in `configurable`, as with a checkpointer). The same call anywhere in that thread is the same action, in this turn or a later one.
+- **Without a thread:** the same call within one run. A new `invoke` is a new request, decided afresh.
+- **With the tool's `key`:** the same call wherever it is made, in any thread or process. Use it when the action already has a name in your system:
+
+  ```ts
+  brydgeMiddleware({
+    client: brydge,
+    actor: "agent:refund-ops",
+    tools: { refund: { target: "chargeId", key: (args) => `refund:${args.chargeId}` } },
+  });
+  ```
+
+A call with a different target or different facts is always a different action, so allowing a £42 refund never lets the agent refund £420.
+
+### One authorization, one execution
+
+A call made again after it has already run gets the same `ALLOWED` back, and running the tool again would do the work twice under one permission. So the middleware runs each authorization once. When the model asks again for an action this run or this process already carried out, the tool does not run, and the model is told it was already done. Two identical calls made at once run once. A call that failed, because the tool threw or returned an error, can be tried again.
+
+The middleware knows what this run's messages show (a checkpointed thread's included) and what this process has run. Where the same authorization could reach another process, give the destination the authorization as its own idempotency key as well, as the quick start does with Stripe. If an action does run twice under one authorization, a check reports `MISMATCH` with `DUPLICATE_EXECUTION`.
 
 ## Let the agent check its own work
 
@@ -188,7 +235,7 @@ const brydge = new BrydgeClient({
   timeoutMs: 30_000,     // default
 });
 
-await brydge.supervise({ actor, action, target, facts, idempotencyKey }); // ask before acting
+await brydge.supervise({ actor, action, target, facts, idempotencyKey }); // ask before acting; ask again with the same key for a person's answer
 await brydge.report(authorization, "SUCCEEDED");                         // what the agent says happened
 await brydge.verify(authorization);                                      // read the records now
 await brydge.finding(authorization);                                     // what BRYDGE has found so far, free
@@ -201,7 +248,8 @@ The client sends your key only over https, except to `localhost`.
 ## Limits
 
 - BRYDGE treats a target as one piece of work. A second record for the same target that carries a different authorization, such as a second partial refund of one charge, is reported as a `MISMATCH`.
-- The middleware does not wait for a person. An escalated call ends as a message to the model, and a later call is a new request that BRYDGE decides again.
+- The middleware does not wait for a person. An escalated call ends as a message to the model, and the person's answer reaches the agent only when the model makes the same call again: in the same thread, or under the same `key`. Without either, a new run is a new request.
+- A person's refusal stands for that action. Made again under the same key, the call stays refused; to ask afresh, the call needs a new thread, a different `key` or different arguments.
 - A tool that returns a LangGraph `Command` is supervised and reported, but not recorded on a message, so `verifyWork` does not see it. Check it with `brydge.verify(id)`, using the id from `authorizationFor(config)`.
 - The record of each call lives on its tool message. If you trim or summarize messages, check the run first.
 

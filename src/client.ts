@@ -85,6 +85,8 @@ export class BrydgeClient {
    *
    * `ALLOWED` carries the authorization to cite at the destination.
    * `ESCALATED` means a person decides, and the work must not be done yet.
+   * Asking again with the same idempotency key returns their answer: `ALLOWED`
+   * once they allow it, `settled: "REFUSED"` once they refuse it.
    */
   async supervise(input: SuperviseInput, options: RequestOptions = {}): Promise<Supervision> {
     const answer = await this.#request("POST", "/api/supervise", options, {
@@ -105,6 +107,8 @@ export class BrydgeClient {
       checked: Array.isArray(answer.checked) ? (answer.checked as Supervision["checked"]) : [],
       unobserved: Array.isArray(answer.unobserved) ? answer.unobserved.filter((f): f is string => typeof f === "string") : [],
       replayed: answer.replayed === true,
+      settled: answer.settled === "ALLOWED" || answer.settled === "REFUSED" ? answer.settled : null,
+      next: typeof answer.next === "string" && answer.next.length > 0 ? answer.next : null,
     };
   }
 

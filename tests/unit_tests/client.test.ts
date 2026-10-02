@@ -77,6 +77,25 @@ describe("asking before acting", () => {
     expect(answer).toMatchObject({ id: "sup_1", decision: "ESCALATED", mandateId: null, unobserved: ["amount"], replayed: false });
   });
 
+  it("carries a person's answer, and what to do while there is none", async () => {
+    const brydge = fakeBrydge({ decide: () => "ESCALATED" });
+    const ask = () => brydge.client.supervise({ actor: "a", action: "refund", target: "t", idempotencyKey: "k" });
+    expect(await ask()).toMatchObject({ decision: "ESCALATED", settled: null, next: expect.stringMatching(/same idempotency key/) });
+    brydge.settle("sup_1", "ALLOWED");
+    expect(await ask()).toMatchObject({ id: "sup_1", decision: "ALLOWED", settled: "ALLOWED", next: null, replayed: true });
+  });
+
+  it("reads an answer from a server that knows nothing of settlements as unanswered", async () => {
+    const brydge = fakeBrydge({
+      refuse: {
+        "POST /api/supervise": () =>
+          Response.json({ id: "sup_9", decision: "ESCALATED", because: "a person decides", settled: "MAYBE", next: 7 }),
+      },
+    });
+    const answer = await brydge.client.supervise({ actor: "a", action: "refund", target: "t", idempotencyKey: "k" });
+    expect(answer).toMatchObject({ id: "sup_9", decision: "ESCALATED", settled: null, next: null });
+  });
+
   it("refuses to treat a 200 without a decision as permission", async () => {
     const brydge = fakeBrydge({ refuse: { "POST /api/supervise": () => new Response("{}", { status: 200 }) } });
     await expect(

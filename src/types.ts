@@ -1,8 +1,9 @@
 /**
  * What BRYDGE decided before an action happened.
  *
- * - `ALLOWED`: a mandate a person issued covers it, and the agent has room left today.
- * - `ESCALATED`: a person decides. The action has not been done.
+ * - `ALLOWED`: a mandate a person issued covers it and the agent has room left
+ *   today, or a person allowed this one action when it was escalated.
+ * - `ESCALATED`: a person decides, or has refused it. The action has not been done.
  */
 export type Decision = "ALLOWED" | "ESCALATED";
 
@@ -75,6 +76,15 @@ export interface Supervision {
   unobserved: string[];
   /** True when BRYDGE had already answered this exact request. */
   replayed: boolean;
+  /**
+   * How a person answered this escalation, once one has: asked again under the
+   * same idempotency key, an allowed one comes back `ALLOWED` and a refused one
+   * stays `ESCALATED` with `settled: "REFUSED"`. Null while nobody has answered.
+   * Absent from servers older than this field.
+   */
+  settled?: "ALLOWED" | "REFUSED" | null;
+  /** What to do next, on an escalation nobody has answered yet. */
+  next?: string | null;
 }
 
 /** What BRYDGE found about one action. */

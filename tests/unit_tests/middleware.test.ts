@@ -352,22 +352,208 @@ describe("what BRYDGE is told about a call", () => {
     expect(books).toEqual([]);
   });
 
-  it("gives a retried call the same idempotency key, and a different call a different one", async () => {
+  it("asks a retry in the same conversation under the same key, whatever its tool call id", async () => {
+    /*
+     * The key used to carry the tool call id, so a model retrying after "a
+     * person decides" — which is a new tool call — asked as a new action, and
+     * the person's answer to the first could never reach it.
+     */
     const brydge = fakeBrydge();
-    const once = (args: Record<string, unknown>, id: string, thread?: string) =>
-      run(
-        agentWith(brydge, scripted([{ name: "refund", args, id }]), [refundTool()]),
-        thread ? { configurable: { thread_id: thread } } : undefined,
-      );
-    await once({ paymentId: "pi_1", amount: 5 }, "call_1");
-    await once({ paymentId: "pi_1", amount: 5 }, "call_1");
-    await once({ paymentId: "pi_1", amount: 6 }, "call_1");
-    await once({ paymentId: "pi_1", amount: 5 }, "call_1", "thread-b");
-    await once({ paymentId: "pi_1", amount: 5 }, "call_2");
+    const once = (args: Record<string, unknown>, id: string, thread: string) =>
+      run(agentWith(brydge, scripted([{ name: "refund", args, id }]), [refundTool()]), { configurable: { thread_id: thread } });
+    await once({ paymentId: "pi_1", amount: 5 }, "call_1", "thread-a");
+    await once({ paymentId: "pi_1", amount: 5 }, "call_2", "thread-a");
+    await once({ paymentId: "pi_1", amount: 6 }, "call_3", "thread-a");
+    await once({ paymentId: "pi_2", amount: 5 }, "call_4", "thread-a");
+    await once({ paymentId: "pi_1", amount: 5 }, "call_5", "thread-b");
     const keys = brydge.asked().map((a) => String(a.body!.idempotencyKey));
-    expect(keys[0]).toMatch(/^langchain:call_1:[0-9a-f]{32}$/);
+    expect(keys[0]).toMatch(/^langchain:[0-9a-f]{40}$/);
     expect(keys[1]).toBe(keys[0]);
+    /* A different amount, a different payment, another conversation: each its own action. */
     expect(new Set([keys[0], keys[2], keys[3], keys[4]]).size).toBe(4);
+  });
+
+  it("without a thread, a retry within the run shares the key and a separate run does not", async () => {
+    const brydge = fakeBrydge({ decide: () => "ESCALATED" });
+    const args = { paymentId: "pi_1", amount: 5 };
+    /* One run: the model is told a person decides and tries again at once. */
+    await run(
+      agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }], [{ name: "refund", args, id: "call_2" }]), [
+        refundTool(),
+      ]),
+    );
+    /* A separate run, with no thread to say it is the same conversation. */
+    await run(agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }]), [refundTool()]));
+    const keys = brydge.asked().map((a) => String(a.body!.idempotencyKey));
+    expect(keys).toHaveLength(3);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).not.toBe(keys[0]);
+  });
+
+  it("names the action by the tool's own key in every thread, and still by what is asked", async () => {
+    const brydge = fakeBrydge();
+    const supervised = { refund: { target: "paymentId", key: (a: Record<string, any>) => `refund:${a.paymentId}` } };
+    const once = (args: Record<string, unknown>, thread: string) =>
+      run(agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }]), [refundTool()], supervised), {
+        configurable: { thread_id: thread },
+      });
+    await once({ paymentId: "pi_1", amount: 5 }, "thread-a");
+    await once({ paymentId: "pi_1", amount: 5 }, "thread-b");
+    await once({ paymentId: "pi_1", amount: 9 }, "thread-b");
+    const keys = brydge.asked().map((a) => String(a.body!.idempotencyKey));
+    expect(keys[1]).toBe(keys[0]);
+    /* The same name with a different amount is not the same action, and must not be told it is. */
+    expect(keys[2]).not.toBe(keys[0]);
+  });
+
+  it("refuses a key that names nothing", async () => {
+    const brydge = fakeBrydge();
+    const outcome = await run(
+      agentWith(brydge, scripted([{ name: "refund", args: { paymentId: "pi_1", amount: 5 }, id: "c" }]), [refundTool()], {
+        refund: { target: "paymentId", key: () => " " },
+      }),
+    ).catch((e: unknown) => e);
+    expect(BrydgeError.find(outcome)?.message).toMatch(/key\(\) for "refund" must return a non-empty string/);
+    expect(brydge.sent).toEqual([]);
+  });
+});
+
+describe("a person's answer reaches the agent", () => {
+  const thread = { configurable: { thread_id: "thread-approval" } };
+  const args = { paymentId: "pi_1", amount: 4200 };
+
+  it("escalated, then allowed by a person: the retry goes ahead, once, under the same authorization", async () => {
+    const brydge = fakeBrydge({ decide: () => "ESCALATED" });
+    const books: Array<{ authorization: string; paymentId: string; amount: unknown }> = [];
+    const agent = agentWith(
+      brydge,
+      scripted([{ name: "refund", args, id: "call_1" }], [{ name: "refund", args, id: "call_2" }], [{ name: "refund", args, id: "call_3" }]),
+      [refundTool(books)],
+    );
+
+    /* Turn one: a person has to decide. The model is told how it will hear the answer — in its own terms. */
+    const first = await run(agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }]), [refundTool(books)]), thread);
+    const [waiting] = toolMessages(first);
+    expect(waiting!.content).toMatch(/^Not done\. BRYDGE has passed this to a person/);
+    expect(waiting!.content).toContain("Once they have answered, call refund again with the same arguments");
+    expect(waiting!.content).not.toMatch(/idempotency key/);
+    expect(books).toEqual([]);
+
+    brydge.settle("sup_1", "ALLOWED");
+
+    /* Turn two, a new tool call in the same conversation: it goes ahead. Asked again, it is not done twice. */
+    const later = await run(agent, thread);
+    expect(books).toEqual([{ authorization: "sup_1", paymentId: "pi_1", amount: 4200 }]);
+    const [ran, again] = toolMessages(later);
+    expect(ran!.metadata?.brydge).toMatchObject({ authorization: "sup_1", decision: "ALLOWED", carriedOut: true });
+    expect(again!.content).toMatch(/^Already done\./);
+    expect(again!.metadata?.brydge).toBeUndefined();
+    expect(brydge.reports()).toHaveLength(1);
+  });
+
+  it("refused by a person: the retry is told so and nothing runs", async () => {
+    const brydge = fakeBrydge({ decide: () => "ESCALATED" });
+    const books: Array<{ authorization: string; paymentId: string; amount: unknown }> = [];
+    await run(agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }]), [refundTool(books)]), thread);
+    brydge.settle("sup_1", "REFUSED", "sam@example.com");
+
+    const later = await run(agentWith(brydge, scripted([{ name: "refund", args, id: "call_2" }]), [refundTool(books)]), thread);
+    const [message] = toolMessages(later);
+    expect(message!.status).toBe("error");
+    /* The person's name stays as BRYDGE gave it: an email is not a word to capitalise. */
+    expect(message!.content).toMatch(
+      /^Not done\. A person refused this, so it must not be carried out\. sam@example\.com refused this on 2026-10-02, so it must not be carried out\. BRYDGE authorization: sup_1\.$/,
+    );
+    expect(books).toEqual([]);
+  });
+});
+
+describe("one authorization, one execution", () => {
+  const args = { paymentId: "pi_1", amount: 5 };
+
+  it("does not run an action again when the model asks for it twice, one after the other", async () => {
+    const brydge = fakeBrydge();
+    const books: Array<{ authorization: string; paymentId: string; amount: unknown }> = [];
+    const result = await run(
+      agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }], [{ name: "refund", args, id: "call_2" }]), [
+        refundTool(books),
+      ]),
+    );
+    expect(books).toHaveLength(1);
+    const [, again] = toolMessages(result);
+    expect(again!.content).toMatch(/^Already done\. This refund was carried out earlier \(tool call call_1\)/);
+    expect(brydge.reports()).toHaveLength(1);
+  });
+
+  it("does not run it twice when the model asks for it twice at once", async () => {
+    const brydge = fakeBrydge();
+    const books: Array<{ authorization: string; paymentId: string; amount: unknown }> = [];
+    const result = await run(
+      agentWith(brydge, scripted([{ name: "refund", args, id: "call_1" }, { name: "refund", args, id: "call_2" }]), [
+        refundTool(books),
+      ]),
+    );
+    expect(books).toHaveLength(1);
+    expect(toolMessages(result).map((m) => String(m.content).split(".")[0]).sort()).toEqual([
+      "Already done",
+      "Refunded pi_1",
+    ]);
+  });
+
+  /* toolErrorMiddleware first shipped in langchain 1.5.4. */
+  it.skipIf(typeof toolErrorMiddleware !== "function")(
+    "lets the second of two calls at once go ahead when the first failed",
+    async () => {
+      const brydge = fakeBrydge();
+      let attempts = 0;
+      const flaky = tool(
+        async ({ paymentId }) => {
+          if (++attempts === 1) throw new Error("the processor timed out");
+          return `Refunded ${paymentId}.`;
+        },
+        { name: "refund", description: "Refund a payment", schema: z.object({ paymentId: z.string(), amount: z.number() }) },
+      );
+      const agent = createAgent({
+        model: scripted([{ name: "refund", args, id: "call_1" }, { name: "refund", args, id: "call_2" }]),
+        tools: [flaky],
+        middleware: [
+          toolErrorMiddleware({ onError: (e) => `Failed: ${e instanceof Error ? e.message : String(e)}` }),
+          brydgeMiddleware({ actor: ACTOR, tools: { refund: { target: "paymentId" } }, client: brydge.client }),
+        ],
+      });
+      const result = await run(agent);
+      expect(attempts).toBe(2);
+      expect(toolMessages(result).map((m) => [m.status, m.content]).sort()).toEqual([
+        ["error", "Failed: the processor timed out"],
+        ["success", "Refunded pi_1."],
+      ]);
+    },
+  );
+
+  /* toolErrorMiddleware first shipped in langchain 1.5.4. */
+  it.skipIf(typeof toolErrorMiddleware !== "function")("lets a run that failed be tried again", async () => {
+    const brydge = fakeBrydge();
+    let attempts = 0;
+    const flaky = tool(
+      async ({ paymentId }, config) => {
+        if (++attempts === 1) throw new Error("the processor timed out");
+        return `Refunded ${paymentId} under ${authorizationFor(config)}.`;
+      },
+      { name: "refund", description: "Refund a payment", schema: z.object({ paymentId: z.string(), amount: z.number() }) },
+    );
+    const agent = createAgent({
+      model: scripted([{ name: "refund", args, id: "call_1" }], [{ name: "refund", args, id: "call_2" }]),
+      tools: [flaky],
+      middleware: [
+        toolErrorMiddleware({ onError: (e) => `Failed: ${e instanceof Error ? e.message : String(e)}` }),
+        brydgeMiddleware({ actor: ACTOR, tools: { refund: { target: "paymentId" } }, client: brydge.client }),
+      ],
+    });
+    const result = await run(agent);
+    expect(attempts).toBe(2);
+    const [failed, retried] = toolMessages(result);
+    expect(failed!.status).toBe("error");
+    expect(retried!.content).toBe("Refunded pi_1 under sup_1.");
   });
 });
 
